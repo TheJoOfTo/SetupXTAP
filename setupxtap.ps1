@@ -1,124 +1,151 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
 # ============================================================
-# Microsoft 365 Cross-Tenant Access Policy Setup
-#
-# Microsoft Graph v1.0 only.
-#
-# Order of operations:
-#
-#   1. Resolve partner tenant ID
-#   2. Connect to Microsoft Graph
-#   3. Create/verify the parent Entra XTAP partner relationship
-#   4. Configure M365 Collaboration inbound access
-#   5. Discover existing M365 capabilities
-#   6. Create missing capabilities
-#   7. Update selected capabilities
-#   8. Display final configuration
-#
-# No Exchange Online cmdlets are used.
-# No Microsoft Graph Beta cmdlets or endpoints are used.
+# Microsoft 365 Cross-Tenant Access Policy Management
+# Microsoft Graph v1.0 only
 # ============================================================
 
 function Write-Section {
+    param([Parameter(Mandatory)][string]$Title)
+
+    Write-Host ''
+    Write-Host '==================================================' -ForegroundColor Cyan
+    Write-Host " $Title" -ForegroundColor Cyan
+    Write-Host '==================================================' -ForegroundColor Cyan
+    Write-Host ''
+}
+
+function Read-Number {
     param(
-        [Parameter(Mandatory)]
-        [string]$Title
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][int]$Minimum,
+        [Parameter(Mandatory)][int]$Maximum
     )
 
-    Write-Host ""
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host " $Title" -ForegroundColor Cyan
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host ""
+    while ($true) {
+        $Text = (Read-Host $Prompt).Trim()
+
+        if ($Text -notmatch '^\d+$') {
+            Write-Host "Enter a number from $Minimum through $Maximum." -ForegroundColor Red
+            continue
+        }
+
+        try {
+            $Number = [int]$Text
+        }
+        catch {
+            Write-Host "Enter a number from $Minimum through $Maximum." -ForegroundColor Red
+            continue
+        }
+
+        if ($Number -lt $Minimum -or $Number -gt $Maximum) {
+            Write-Host "Enter a number from $Minimum through $Maximum." -ForegroundColor Red
+            continue
+        }
+
+        return $Number
+    }
 }
 
 function Read-YesNo {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Prompt
-    )
+    param([Parameter(Mandatory)][string]$Prompt)
 
-    do {
-        $Answer = Read-Host "$Prompt [Y/N]"
+    while ($true) {
+        $Answer = (Read-Host "$Prompt [Y/N]").Trim().ToUpperInvariant()
 
-        if ($null -ne $Answer) {
-            $Answer = $Answer.Trim().ToUpperInvariant()
+        if ($Answer -eq 'Y') {
+            return $true
         }
 
-        if ($Answer -notin @("Y", "N")) {
-            Write-Host "Enter Y or N." -ForegroundColor Red
+        if ($Answer -eq 'N') {
+            return $false
         }
+
+        Write-Host 'Enter Y or N.' -ForegroundColor Red
     }
-    until ($Answer -in @("Y", "N"))
-
-    return ($Answer -eq "Y")
 }
 
-function Test-NotFoundError {
+function Write-GraphError {
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $ErrorText = [string]$ErrorRecord.Exception.Message
+    $Exception = $ErrorRecord.Exception
+    $Messages = @()
+
+    while ($null -ne $Exception) {
+        if ($Exception.Message) {
+            if ($Exception.Message -notin $Messages) {
+                $Messages += $Exception.Message
+            }
+        }
+
+        $Exception = $Exception.InnerException
+    }
 
     if ($ErrorRecord.ErrorDetails) {
-        $ErrorText += " " + [string]$ErrorRecord.ErrorDetails.Message
-    }
-
-    return (
-        $ErrorText -match "(?i)\b404\b" -or
-        $ErrorText -match "(?i)notfound" -or
-        $ErrorText -match "(?i)not found" -or
-        $ErrorText -match "(?i)directory_objectnotfound" -or
-        $ErrorText -match "(?i)unable to read the company information"
-    )
-}
-
-function Resolve-PartnerTenantId {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Domain
-    )
-
-    $DiscoveryUri =
-        "https://login.microsoftonline.com/$Domain/v2.0/.well-known/openid-configuration"
-
-    $DiscoveryResponse = Invoke-RestMethod `
-        -Uri $DiscoveryUri `
-        -Method Get `
-        -ErrorAction Stop
-
-    if ($null -eq $DiscoveryResponse) {
-        throw "The Microsoft identity platform returned an empty discovery response."
-    }
-
-    $DiscoveryValues = @(
-        $DiscoveryResponse.issuer
-        $DiscoveryResponse.authorization_endpoint
-        $DiscoveryResponse.token_endpoint
-        $DiscoveryResponse.jwks_uri
-    ) | Where-Object {
-        $null -ne $_ -and ([string]$_).Trim().Length -gt 0
-    }
-
-    $GuidPattern =
-        "(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-
-    foreach ($DiscoveryValue in $DiscoveryValues) {
-        if (([string]$DiscoveryValue) -match $GuidPattern) {
-            return $Matches[1].ToLowerInvariant()
+        if ($ErrorRecord.ErrorDetails.Message) {
+            if ($ErrorRecord.ErrorDetails.Message -notin $Messages) {
+                $Messages += $ErrorRecord.ErrorDetails.Message
+            }
         }
     }
 
-    throw "The discovery response did not contain a Microsoft Entra tenant GUID."
+    if ($Messages.Count -eq 0) {
+        Write-Host 'Microsoft Graph returned an unspecified error.' -ForegroundColor Red
+    }
+    else {
+        foreach ($Message in $Messages) {
+            Write-Host $Message -ForegroundColor Red
+        }
+    }
 }
 
-function Invoke-XtapGraphRequest {
+function Test-NotFound {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet("GET", "POST", "PATCH", "DELETE")]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $Text = [string]$ErrorRecord.Exception.Message
+
+    if ($ErrorRecord.ErrorDetails) {
+        $Text += ' ' + [string]$ErrorRecord.ErrorDetails.Message
+    }
+
+    if ($Text -match '(?i)404|notfound|not found') {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-Property {
+    param(
+        [Parameter(Mandatory)][object]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+
+        return $null
+    }
+
+    if ($Object.PSObject.Properties.Name -contains $Name) {
+        return $Object.$Name
+    }
+
+    return $null
+}
+
+function Invoke-XtapGraph {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('GET', 'POST', 'PATCH', 'DELETE')]
         [string]$Method,
 
         [Parameter(Mandatory)]
@@ -127,83 +154,53 @@ function Invoke-XtapGraphRequest {
         [hashtable]$Body
     )
 
-    $Parameters = @{
+    $Params = @{
         Method      = $Method
         Uri         = $Uri
-        ErrorAction = "Stop"
+        ErrorAction = 'Stop'
     }
 
     if ($null -ne $Body) {
-        $Parameters["Body"] =
-            $Body | ConvertTo-Json -Depth 20 -Compress
-
-        $Parameters["ContentType"] =
-            "application/json"
+        $Params['Body'] = $Body | ConvertTo-Json -Depth 20 -Compress
+        $Params['ContentType'] = 'application/json'
     }
 
-    Invoke-MgGraphRequest @Parameters
+    Invoke-MgGraphRequest @Params
 }
 
-function Get-CapabilityCollection {
+function Get-XtapCollection {
     param(
-        [Parameter(Mandatory)]
-        [string]$CapabilitiesUri
+        [Parameter(Mandatory)][string]$Uri,
+        [switch]$EmptyOnNotFound
     )
 
     try {
-        $AllCapabilities = @()
-        $NextLink = $CapabilitiesUri
+        $Results = @()
+        $Next = $Uri
 
-        while ($NextLink) {
-            $Response =
-                Invoke-XtapGraphRequest `
-                    -Method GET `
-                    -Uri $NextLink
+        while ($Next) {
+            $Response = Invoke-XtapGraph -Method GET -Uri $Next
 
             if ($null -eq $Response) {
                 break
             }
 
-            if (
-                $Response -is [System.Collections.IDictionary] -and
-                $Response.Contains("value")
-            ) {
-                $AllCapabilities += @($Response["value"])
+            $Value = Get-Property -Object $Response -Name 'value'
 
-                if ($Response.Contains("@odata.nextLink")) {
-                    $NextLink =
-                        [string]$Response["@odata.nextLink"]
-                }
-                else {
-                    $NextLink = $null
-                }
-            }
-            elseif (
-                $Response.PSObject.Properties.Name -contains "value"
-            ) {
-                $AllCapabilities += @($Response.value)
-
-                if (
-                    $Response.PSObject.Properties.Name -contains
-                    "@odata.nextLink"
-                ) {
-                    $NextLink =
-                        [string]$Response.'@odata.nextLink'
-                }
-                else {
-                    $NextLink = $null
-                }
+            if ($null -ne $Value) {
+                $Results += @($Value)
+                $Next = Get-Property -Object $Response -Name '@odata.nextLink'
             }
             else {
-                $AllCapabilities += @($Response)
-                $NextLink = $null
+                $Results += @($Response)
+                $Next = $null
             }
         }
 
-        return @($AllCapabilities)
+        return @($Results)
     }
     catch {
-        if (Test-NotFoundError -ErrorRecord $_) {
+        if ($EmptyOnNotFound -and (Test-NotFound -ErrorRecord $_)) {
             return @()
         }
 
@@ -211,856 +208,844 @@ function Get-CapabilityCollection {
     }
 }
 
-function Get-CapabilityName {
-    param(
-        [Parameter(Mandatory)]
-        [object]$CapabilityObject
-    )
+function Initialize-Graph {
+    Write-Section 'MICROSOFT GRAPH V1.0 MODULE'
 
-    $Name = $null
+    $Module = 'Microsoft.Graph.Authentication'
 
-    if ($CapabilityObject -is [System.Collections.IDictionary]) {
-        if ($CapabilityObject.Contains("name")) {
-            $Name = [string]$CapabilityObject["name"]
+    if (-not (Get-Module -ListAvailable -Name $Module)) {
+        Write-Host "Installing $Module..." -ForegroundColor Yellow
+
+        $InstallParams = @{
+            Name         = $Module
+            Scope        = 'CurrentUser'
+            Repository   = 'PSGallery'
+            Force        = $true
+            AllowClobber = $true
+            ErrorAction  = 'Stop'
         }
 
-        if (
-            -not $Name -and
-            $CapabilityObject.Contains("id")
-        ) {
-            $Name = [string]$CapabilityObject["id"]
-        }
+        Install-Module @InstallParams
+    }
 
-        if (
-            -not $Name -and
-            $CapabilityObject.Contains("@odata.type")
-        ) {
-            $Name =
-                [string]$CapabilityObject["@odata.type"]
+    Import-Module $Module -Force -ErrorAction Stop
+
+    foreach ($Command in @('Connect-MgGraph', 'Get-MgContext', 'Invoke-MgGraphRequest')) {
+        if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
+            throw "Required command '$Command' is unavailable."
         }
     }
-    else {
-        if (
-            $CapabilityObject.PSObject.Properties.Name -contains
-            "name"
-        ) {
-            $Name =
-                [string]$CapabilityObject.name
+
+    Write-Host 'Microsoft Graph module is available.' -ForegroundColor Green
+}
+
+function Connect-XtapGraph {
+    Write-Section 'MICROSOFT GRAPH CONNECTION'
+
+    $Params = @{
+        Scopes = @(
+            'Policy.Read.All'
+            'Policy.ReadWrite.CrossTenantAccess'
+            'Policy.ReadWrite.CrossTenantCapability'
+        )
+        ContextScope = 'Process'
+        ErrorAction  = 'Stop'
+    }
+
+    $Command = Get-Command Connect-MgGraph -ErrorAction Stop
+
+    if ($Command.Parameters.ContainsKey('NoWelcome')) {
+        $Params['NoWelcome'] = $true
+    }
+
+    Connect-MgGraph @Params
+
+    $Context = Get-MgContext -ErrorAction Stop
+
+    if ($null -eq $Context) {
+        throw 'Microsoft Graph connection was not established.'
+    }
+
+    if (-not $Context.TenantId) {
+        throw 'Microsoft Graph did not return a tenant ID.'
+    }
+
+    $TenantId = ([string]$Context.TenantId).Trim().ToLowerInvariant()
+
+    Write-Host "Connected Account : $($Context.Account)" -ForegroundColor Green
+    Write-Host "Connected Tenant  : $TenantId" -ForegroundColor Green
+
+    return $TenantId
+}
+
+function Resolve-PartnerTenantId {
+    param([Parameter(Mandatory)][string]$Domain)
+
+    $Uri = "https://login.microsoftonline.com/$Domain/v2.0/.well-known/openid-configuration"
+
+    $Response = Invoke-RestMethod -Uri $Uri -Method Get -ErrorAction Stop
+
+    $Values = @(
+        $Response.issuer
+        $Response.authorization_endpoint
+        $Response.token_endpoint
+        $Response.jwks_uri
+    )
+
+    $Pattern = '(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+
+    foreach ($Value in $Values) {
+        if ($null -eq $Value) {
+            continue
         }
 
-        if (
-            -not $Name -and
-            $CapabilityObject.PSObject.Properties.Name -contains
-            "id"
-        ) {
-            $Name =
-                [string]$CapabilityObject.id
+        if (([string]$Value) -match $Pattern) {
+            return $Matches[1].ToLowerInvariant()
+        }
+    }
+
+    throw 'Unable to determine the Microsoft Entra tenant ID.'
+}
+
+function Read-PartnerDomain {
+    Write-Section 'PARTNER DOMAIN'
+
+    Write-Host 'Enter a verified domain belonging to the partner organization.'
+    Write-Host 'Example: contoso.com' -ForegroundColor DarkGray
+    Write-Host ''
+
+    while ($true) {
+        $Domain = (Read-Host 'Enter the partner organization domain').Trim().ToLowerInvariant()
+
+        if ($Domain.StartsWith('https://')) {
+            $Domain = $Domain.Substring(8)
         }
 
-        if (
-            -not $Name -and
-            $CapabilityObject.PSObject.Properties.Name -contains
-            "@odata.type"
-        ) {
-            $Name =
-                [string]$CapabilityObject.'@odata.type'
+        if ($Domain.StartsWith('http://')) {
+            $Domain = $Domain.Substring(7)
         }
+
+        if ($Domain.StartsWith('www.')) {
+            $Domain = $Domain.Substring(4)
+        }
+
+        $Slash = $Domain.IndexOf('/')
+
+        if ($Slash -ge 0) {
+            $Domain = $Domain.Substring(0, $Slash)
+        }
+
+        $Domain = $Domain.Trim().TrimEnd('.')
+
+        if ($Domain -match '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,63}$') {
+            return $Domain
+        }
+
+        Write-Host 'Enter a valid domain, for example contoso.com.' -ForegroundColor Red
+    }
+}
+
+function Get-PartnerTenantId {
+    param([Parameter(Mandatory)][object]$Partner)
+
+    $TenantId = Get-Property -Object $Partner -Name 'tenantId'
+
+    if (-not $TenantId) {
+        $TenantId = Get-Property -Object $Partner -Name 'id'
+    }
+
+    if ($TenantId) {
+        return ([string]$TenantId).Trim().ToLowerInvariant()
+    }
+
+    return $null
+}
+
+function Get-PartnerDisplayName {
+    param([Parameter(Mandatory)][object]$Partner)
+
+    $Name = Get-Property -Object $Partner -Name 'displayName'
+
+    if (-not $Name) {
+        $Name = Get-Property -Object $Partner -Name 'tenantName'
     }
 
     if ($Name) {
-        $Name = $Name `
-            -replace "^#microsoft\.graph\.", "" `
-            -replace "^microsoft\.graph\.", ""
+        return ([string]$Name).Trim()
     }
 
-    return $Name
+    return $null
 }
 
-# ============================================================
-# Start
-# ============================================================
+function Get-CapabilityName {
+    param([Parameter(Mandatory)][object]$Capability)
 
-Write-Section "MICROSOFT 365 CROSS-TENANT ACCESS POLICY SETUP"
+    $Name = Get-Property -Object $Capability -Name 'name'
 
-# ============================================================
-# Partner Domain
-# ============================================================
-
-Write-Host "Enter a verified domain belonging to the partner organization." -ForegroundColor Cyan
-Write-Host "Example: contoso.com" -ForegroundColor DarkGray
-Write-Host ""
-
-do {
-    $PartnerDomain =
-        Read-Host "Enter the partner organization domain"
-
-    if ($null -ne $PartnerDomain) {
-        $PartnerDomain =
-            $PartnerDomain.Trim().ToLowerInvariant()
+    if (-not $Name) {
+        $Name = Get-Property -Object $Capability -Name 'id'
     }
 
-    if (-not $PartnerDomain) {
-        Write-Host "Domain name cannot be empty." -ForegroundColor Red
-        Write-Host ""
-        continue
+    if (-not $Name) {
+        $Name = Get-Property -Object $Capability -Name '@odata.type'
     }
 
-    $PartnerDomain = $PartnerDomain `
-        -replace "^https?://", "" `
-        -replace "^www\.", "" `
-        -replace "/.*$", ""
-
-    if (
-        -not $PartnerDomain -or
-        $PartnerDomain.Length -gt 253 -or
-        $PartnerDomain -notmatch "^(?=.{1,253}$)(?:(?!-)[a-z0-9-]{1,63}(?<!-)\.)+(?!-)[a-z0-9-]{2,63}(?<!-)$"
-    ) {
-        Write-Host "Enter a valid domain name, for example contoso.com." -ForegroundColor Red
-        Write-Host ""
-
-        $PartnerDomain = $null
-    }
-}
-until ($PartnerDomain)
-
-# ============================================================
-# Resolve Partner Tenant ID
-# ============================================================
-
-Write-Host ""
-Write-Host "Resolving the Microsoft Entra tenant for $PartnerDomain..." -ForegroundColor Yellow
-
-try {
-    $PartnerTenantId =
-        Resolve-PartnerTenantId `
-            -Domain $PartnerDomain
-}
-catch {
-    Write-Host ""
-    Write-Host "Unable to resolve the partner domain." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Fallback tenant lookup:" -ForegroundColor Yellow
-    Write-Host "https://gettenantpartitionweb.azurewebsites.net/" -ForegroundColor Cyan
-
-    throw
-}
-
-if (-not $PartnerTenantId) {
-    throw "Partner Tenant ID is empty."
-}
-
-Write-Host ""
-Write-Host "Partner Domain    : $PartnerDomain" -ForegroundColor Green
-Write-Host "Partner Tenant ID : $PartnerTenantId" -ForegroundColor Green
-
-# ============================================================
-# Free/Busy Selection
-# ============================================================
-
-Write-Section "FREE/BUSY ACCESS"
-
-Write-Host "  0. Do not configure Free/Busy"
-Write-Host ""
-Write-Host "  1. Availability Only"
-Write-Host "     Time only"
-Write-Host ""
-Write-Host "  2. Limited Details"
-Write-Host "     Time, subject, and location"
-Write-Host ""
-
-do {
-    $FreeBusySelection =
-        Read-Host "Select Free/Busy capability [0-2]"
-
-    if ($FreeBusySelection -notin @("0", "1", "2")) {
-        Write-Host "Invalid selection. Enter 0, 1, or 2." -ForegroundColor Red
-    }
-}
-until ($FreeBusySelection -in @("0", "1", "2"))
-
-switch ($FreeBusySelection) {
-    "0" {
-        $FreeBusyCapability = $null
-        $FreeBusyDescription = "Not configured"
+    if ($Name) {
+        return (([string]$Name) -replace '^#?microsoft\.graph\.', '')
     }
 
-    "1" {
-        $FreeBusyCapability =
-            "crossTenantCalendarAvailabilityBasic"
+    return $null
+}
 
-        $FreeBusyDescription =
-            "Availability Only - Time"
+function Test-CapabilityAllowed {
+    param([Parameter(Mandatory)][object]$Capability)
+
+    $Inbound = Get-Property -Object $Capability -Name 'inboundAccess'
+
+    if ($null -eq $Inbound) {
+        return $false
     }
 
-    "2" {
-        $FreeBusyCapability =
-            "crossTenantCalendarAvailabilityLimitedDetails"
+    $Allowed = Get-Property -Object $Inbound -Name 'isAllowed'
 
-        $FreeBusyDescription =
-            "Limited Details - Time, Subject, Location"
-    }
+    return ($Allowed -eq $true)
 }
 
-# ============================================================
-# MailTips Selection
-# ============================================================
+function Get-XtapPartners {
+    $Uri = 'https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners'
 
-Write-Section "MAILTIPS ACCESS"
-
-Write-Host "  0. Do not configure MailTips"
-Write-Host ""
-Write-Host "  1. Limited"
-Write-Host ""
-Write-Host "  2. All"
-Write-Host ""
-
-do {
-    $MailTipsSelection =
-        Read-Host "Select MailTips capability [0-2]"
-
-    if ($MailTipsSelection -notin @("0", "1", "2")) {
-        Write-Host "Invalid selection. Enter 0, 1, or 2." -ForegroundColor Red
-    }
-}
-until ($MailTipsSelection -in @("0", "1", "2"))
-
-switch ($MailTipsSelection) {
-    "0" {
-        $MailTipsCapability = $null
-        $MailTipsDescription = "Not configured"
-    }
-
-    "1" {
-        $MailTipsCapability =
-            "crossTenantMailTipsLimited"
-
-        $MailTipsDescription =
-            "Limited"
-    }
-
-    "2" {
-        $MailTipsCapability =
-            "crossTenantMailTipsAll"
-
-        $MailTipsDescription =
-            "All"
-    }
+    return @(Get-XtapCollection -Uri $Uri -EmptyOnNotFound)
 }
 
-# ============================================================
-# Calendar Sharing Selection
-# ============================================================
+function Get-XtapPartner {
+    param([Parameter(Mandatory)][string]$PartnerTenantId)
 
-Write-Section "CALENDAR SHARING ACCESS"
+    $Uri = "https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners/$PartnerTenantId"
 
-Write-Host "  0. Do not configure Calendar Sharing"
-Write-Host ""
-Write-Host "  1. Free/Busy Simple"
-Write-Host "     Time only"
-Write-Host ""
-Write-Host "  2. Free/Busy Detail"
-Write-Host "     Time, subject, and location"
-Write-Host ""
-Write-Host "  3. Reviewer"
-Write-Host "     Full calendar details"
-Write-Host ""
-
-do {
-    $CalendarSelection =
-        Read-Host "Select Calendar Sharing capability [0-3]"
-
-    if ($CalendarSelection -notin @("0", "1", "2", "3")) {
-        Write-Host "Invalid selection. Enter 0, 1, 2, or 3." -ForegroundColor Red
-    }
-}
-until ($CalendarSelection -in @("0", "1", "2", "3"))
-
-switch ($CalendarSelection) {
-    "0" {
-        $CalendarCapability = $null
-        $CalendarDescription = "Not configured"
-    }
-
-    "1" {
-        $CalendarCapability =
-            "crossTenantCalendarSharingFreeBusySimple"
-
-        $CalendarDescription =
-            "Free/Busy Simple - Time"
-    }
-
-    "2" {
-        $CalendarCapability =
-            "crossTenantCalendarSharingFreeBusyDetail"
-
-        $CalendarDescription =
-            "Free/Busy Detail - Time, Subject, Location"
-    }
-
-    "3" {
-        $CalendarCapability =
-            "crossTenantCalendarSharingFreeBusyReviewer"
-
-        $CalendarDescription =
-            "Reviewer - Full Calendar Details"
-    }
+    return Invoke-XtapGraph -Method GET -Uri $Uri
 }
 
-# ============================================================
-# Build Capability List
-# ============================================================
+function Get-XtapCapabilities {
+    param([Parameter(Mandatory)][string]$PartnerTenantId)
 
-$Capabilities = @()
+    $Uri = "https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners/$PartnerTenantId/m365Capabilities"
 
-if ($FreeBusyCapability) {
-    $Capabilities += $FreeBusyCapability
+    return @(Get-XtapCollection -Uri $Uri -EmptyOnNotFound)
 }
 
-if ($CalendarCapability) {
-    $Capabilities += $CalendarCapability
-}
+function Select-XtapPartner {
+    param([Parameter(Mandatory)][array]$Partners)
 
-if ($MailTipsCapability) {
-    $Capabilities += $MailTipsCapability
-}
+    $List = @()
 
-if ($Capabilities.Count -eq 0) {
-    Write-Section "NO CAPABILITIES SELECTED"
+    foreach ($Partner in $Partners) {
+        $TenantId = Get-PartnerTenantId -Partner $Partner
 
-    Write-Host "No changes have been made." -ForegroundColor Yellow
+        if (-not $TenantId) {
+            continue
+        }
 
-    return
-}
-
-# ============================================================
-# Configuration Confirmation
-# ============================================================
-
-Write-Section "SELECTED CONFIGURATION"
-
-Write-Host "Partner Domain    : $PartnerDomain"
-Write-Host "Partner Tenant ID : $PartnerTenantId"
-Write-Host ""
-
-Write-Host "Free/Busy         : $FreeBusyDescription"
-Write-Host "MailTips          : $MailTipsDescription"
-Write-Host "Calendar Sharing  : $CalendarDescription"
-
-Write-Host ""
-Write-Host "Selected capabilities:" -ForegroundColor Cyan
-
-foreach ($Capability in $Capabilities) {
-    Write-Host "  $Capability"
-}
-
-Write-Host ""
-
-if (-not (Read-YesNo "Continue with this configuration?")) {
-    Write-Host ""
-    Write-Host "Operation cancelled. No changes made." -ForegroundColor Yellow
-
-    return
-}
-
-# ============================================================
-# Microsoft Graph v1.0 Modules
-# ============================================================
-
-Write-Section "MICROSOFT GRAPH V1.0 MODULES"
-
-$RequiredModules = @(
-    "Microsoft.Graph.Authentication"
-    "Microsoft.Graph.Identity.SignIns"
-)
-
-foreach ($RequiredModule in $RequiredModules) {
-    if (-not (Get-Module -ListAvailable -Name $RequiredModule)) {
-        Write-Host "Installing $RequiredModule..." -ForegroundColor Yellow
-
-        Install-Module `
-            -Name $RequiredModule `
-            -Scope CurrentUser `
-            -Repository PSGallery `
-            -Force `
-            -AllowClobber `
-            -ErrorAction Stop
-    }
-
-    Write-Host "Importing $RequiredModule..." -ForegroundColor Yellow
-
-    Import-Module `
-        -Name $RequiredModule `
-        -Force `
-        -ErrorAction Stop
-}
-
-# ============================================================
-# Confirm Required v1.0 Commands
-# ============================================================
-
-$RequiredCommands = @(
-    "Connect-MgGraph"
-    "Get-MgContext"
-    "Invoke-MgGraphRequest"
-    "Get-MgPolicyCrossTenantAccessPolicyPartner"
-    "New-MgPolicyCrossTenantAccessPolicyPartner"
-    "Update-MgPolicyCrossTenantAccessPolicyPartner"
-    "Get-MgPolicyCrossTenantAccessPolicyPartnerM365Capability"
-)
-
-foreach ($RequiredCommand in $RequiredCommands) {
-    if (-not (Get-Command $RequiredCommand -ErrorAction SilentlyContinue)) {
-        throw "Required Microsoft Graph v1.0 command '$RequiredCommand' is unavailable. Update the Microsoft.Graph.Identity.SignIns module and try again."
-    }
-}
-
-# ============================================================
-# Microsoft Graph Connection
-# ============================================================
-
-Write-Section "MICROSOFT GRAPH CONNECTION"
-
-$Scopes = @(
-    "Policy.Read.All"
-    "Policy.ReadWrite.CrossTenantAccess"
-    "Policy.ReadWrite.CrossTenantCapability"
-)
-
-$ConnectParameters = @{
-    Scopes       = $Scopes
-    ContextScope = "Process"
-    ErrorAction  = "Stop"
-}
-
-$ConnectCommand =
-    Get-Command Connect-MgGraph -ErrorAction Stop
-
-if ($ConnectCommand.Parameters.ContainsKey("NoWelcome")) {
-    $ConnectParameters["NoWelcome"] = $true
-}
-
-Connect-MgGraph @ConnectParameters
-
-$GraphContext =
-    Get-MgContext -ErrorAction Stop
-
-if ($null -eq $GraphContext) {
-    throw "Microsoft Graph connection was not established."
-}
-
-$ConnectedTenantId =
-    ([string]$GraphContext.TenantId).Trim()
-
-if (-not $ConnectedTenantId) {
-    throw "Microsoft Graph did not return the connected Tenant ID."
-}
-
-if ($ConnectedTenantId -eq $PartnerTenantId) {
-    throw "The connected tenant and partner tenant cannot be the same."
-}
-
-Write-Host ""
-Write-Host "Connected Account : $($GraphContext.Account)" -ForegroundColor Green
-Write-Host "Connected Tenant  : $ConnectedTenantId" -ForegroundColor Green
-Write-Host "Partner Tenant    : $PartnerTenantId" -ForegroundColor Green
-
-# ============================================================
-# Microsoft Graph v1.0 URLs
-# ============================================================
-
-$PartnerUri =
-    "https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners/$PartnerTenantId"
-
-$CapabilitiesUri =
-    "$PartnerUri/m365Capabilities"
-
-# ============================================================
-# Parent Entra XTAP Policy
-#
-# This must exist before any M365 capability is created.
-# ============================================================
-
-Write-Section "ENTRA CROSS-TENANT PARTNER POLICY"
-
-$ParentPartner = $null
-
-Write-Host "Checking for parent Entra cross-tenant partner policy..." -ForegroundColor Yellow
-
-try {
-    $ParentPartner =
-        Get-MgPolicyCrossTenantAccessPolicyPartner `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -ErrorAction Stop
-}
-catch {
-    if (Test-NotFoundError -ErrorRecord $_) {
-        $ParentPartner = $null
-    }
-    else {
-        throw
-    }
-}
-
-# ============================================================
-# Create Parent When Missing
-# ============================================================
-
-if ($null -eq $ParentPartner) {
-    Write-Host "Parent Entra partner policy does not exist." -ForegroundColor Yellow
-    Write-Host "Creating parent Entra partner policy..." -ForegroundColor Yellow
-
-    try {
-        New-MgPolicyCrossTenantAccessPolicyPartner `
-            -TenantId $PartnerTenantId `
-            -ErrorAction Stop |
-            Out-Null
-    }
-    catch {
-        Write-Host ""
-        Write-Host "FAILED to create the parent Entra cross-tenant partner policy." -ForegroundColor Red
-        Write-Host ""
-        Write-Host $_.Exception.Message -ForegroundColor Red
-
-        throw
-    }
-
-    Write-Host "Parent Entra partner policy creation command completed." -ForegroundColor Green
-}
-else {
-    Write-Host "Parent Entra partner policy already exists." -ForegroundColor Green
-}
-
-# ============================================================
-# Critical Parent Verification
-# ============================================================
-
-Write-Host ""
-Write-Host "Verifying parent Entra partner policy..." -ForegroundColor Yellow
-
-try {
-    $ParentPartner =
-        Get-MgPolicyCrossTenantAccessPolicyPartner `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -ErrorAction Stop
-}
-catch {
-    Write-Host ""
-    Write-Host "STOPPING." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "The parent Entra cross-tenant partner policy could not be retrieved." -ForegroundColor Red
-    Write-Host "M365 capabilities will NOT be created." -ForegroundColor Red
-    Write-Host ""
-    Write-Host $_.Exception.Message -ForegroundColor Red
-
-    throw
-}
-
-if ($null -eq $ParentPartner) {
-    throw "The parent Entra cross-tenant partner policy was not returned by Microsoft Graph. M365 capability creation has been stopped."
-}
-
-Write-Host "Parent Entra cross-tenant partner policy verified." -ForegroundColor Green
-Write-Host ""
-Write-Host "Tenant ID         : $($ParentPartner.TenantId)" -ForegroundColor Cyan
-
-# ============================================================
-# Microsoft 365 Collaboration Inbound Trust
-# ============================================================
-
-Write-Section "MICROSOFT 365 COLLABORATION TRUST"
-
-$M365CollaborationInbound = @{
-    users = @{
-        accessType = "allowed"
-
-        targets = @(
-            @{
-                target     = "AllUsers"
-                targetType = "user"
-            }
-        )
-    }
-}
-
-Write-Host "Applying Microsoft 365 Collaboration inbound trust..." -ForegroundColor Yellow
-
-Update-MgPolicyCrossTenantAccessPolicyPartner `
-    -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-    -M365CollaborationInbound $M365CollaborationInbound `
-    -ErrorAction Stop
-
-Write-Host "Microsoft 365 Collaboration inbound trust applied." -ForegroundColor Green
-
-# ============================================================
-# Verify Parent Again Before Capability Creation
-# ============================================================
-
-Write-Host ""
-Write-Host "Rechecking parent Entra partner policy before capability creation..." -ForegroundColor Yellow
-
-try {
-    $ParentPartner =
-        Get-MgPolicyCrossTenantAccessPolicyPartner `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -ErrorAction Stop
-}
-catch {
-    Write-Host ""
-    Write-Host "STOPPING." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "The required Entra parent policy is not readable." -ForegroundColor Red
-    Write-Host "M365 capabilities will NOT be created." -ForegroundColor Red
-
-    throw
-}
-
-if ($null -eq $ParentPartner) {
-    throw "Required Entra parent policy was not returned. M365 capability creation stopped."
-}
-
-Write-Host "Parent Entra policy confirmed." -ForegroundColor Green
-
-# ============================================================
-# Existing M365 Capabilities
-# ============================================================
-
-Write-Section "EXISTING MICROSOFT 365 CAPABILITIES"
-
-$ExistingCapabilities =
-    Get-CapabilityCollection `
-        -CapabilitiesUri $CapabilitiesUri
-
-Write-Host "Existing capability count: $($ExistingCapabilities.Count)" -ForegroundColor Cyan
-
-# ============================================================
-# Create Missing Capabilities
-# ============================================================
-
-Write-Section "CREATE MISSING CAPABILITIES"
-
-foreach ($Capability in $Capabilities) {
-    $ExistingCapability =
-        $ExistingCapabilities |
-        Where-Object {
-            (Get-CapabilityName -CapabilityObject $_) -eq $Capability
-        } |
-        Select-Object -First 1
-
-    if ($null -ne $ExistingCapability) {
-        Write-Host "Already exists: $Capability" -ForegroundColor Green
-        continue
-    }
-
-    $CreateBody = @{
-        "@odata.type" =
-            "#microsoft.graph.$Capability"
-
-        inboundAccess = @{
-            isAllowed = $true
-
-            resourceScopes = @{
-                included = @(
-                    @{
-                        resourceId   = "All"
-                        resourceType = "user"
-                    }
-                )
-
-                excluded = @()
-            }
+        $List += [PSCustomObject]@{
+            TenantId    = $TenantId
+            DisplayName = Get-PartnerDisplayName -Partner $Partner
         }
     }
 
-    Write-Host ""
-    Write-Host "Creating: $Capability" -ForegroundColor Yellow
+    $List = @($List | Sort-Object DisplayName, TenantId)
 
-    Invoke-XtapGraphRequest `
-        -Method POST `
-        -Uri $CapabilitiesUri `
-        -Body $CreateBody |
-        Out-Null
-
-    Write-Host "Created: $Capability" -ForegroundColor Green
-}
-
-# ============================================================
-# Apply Selected Capability Settings
-# ============================================================
-
-Write-Section "APPLY SELECTED CAPABILITY SETTINGS"
-
-foreach ($Capability in $Capabilities) {
-    $CapabilityUri =
-        "$CapabilitiesUri/$Capability"
-
-    $UpdateBody = @{
-        "@odata.type" =
-            "#microsoft.graph.$Capability"
-
-        inboundAccess = @{
-            isAllowed = $true
-
-            resourceScopes = @{
-                included = @(
-                    @{
-                        resourceId   = "All"
-                        resourceType = "user"
-                    }
-                )
-
-                excluded = @()
-            }
-        }
+    if ($List.Count -eq 0) {
+        return $null
     }
 
-    Write-Host "Updating: $Capability" -ForegroundColor Yellow
+    Write-Section 'EXISTING CROSS-TENANT PARTNERS'
 
-    Invoke-XtapGraphRequest `
-        -Method PATCH `
-        -Uri $CapabilityUri `
-        -Body $UpdateBody |
-        Out-Null
+    for ($Index = 0; $Index -lt $List.Count; $Index++) {
+        $Number = $Index + 1
+        $Partner = $List[$Index]
 
-    Write-Host "Updated: $Capability" -ForegroundColor Green
+        if ($Partner.DisplayName) {
+            Write-Host "  $Number. $($Partner.DisplayName)"
+            Write-Host "     Tenant ID: $($Partner.TenantId)" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host "  $Number. $($Partner.TenantId)"
+        }
+
+        Write-Host ''
+    }
+
+    Write-Host '  0. Return to main menu'
+    Write-Host ''
+
+    $Choice = Read-Number -Prompt "Select a partner [0-$($List.Count)]" -Minimum 0 -Maximum $List.Count
+
+    if ($Choice -eq 0) {
+        return $null
+    }
+
+    return $List[$Choice - 1]
 }
 
-# ============================================================
-# Final XTAP Configuration
-#
-# Uses Microsoft Graph v1.0 PowerShell Get cmdlets.
-# ============================================================
-
-Write-Section "FINAL XTAP CONFIGURATION"
-
-Write-Host "Retrieving configuration using Microsoft Graph v1.0 PowerShell..." -ForegroundColor Yellow
-Write-Host ""
-
-# ============================================================
-# Entra Partner Configuration
-# ============================================================
-
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host " ENTRA PARTNER CONFIGURATION" -ForegroundColor Green
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host ""
-
-try {
-    $FinalEntraPartner =
-        Get-MgPolicyCrossTenantAccessPolicyPartner `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -ErrorAction Stop
-
-    $FinalEntraPartner |
-        Format-List *
-}
-catch {
-    Write-Host "Unable to retrieve the Entra partner configuration." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-}
-
-# ============================================================
-# Microsoft 365 Collaboration Configuration
-# ============================================================
-
-Write-Host ""
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host " MICROSOFT 365 COLLABORATION CONFIGURATION" -ForegroundColor Green
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host ""
-
-try {
-    $FinalM365Partner =
-        Get-MgPolicyCrossTenantAccessPolicyPartner `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -ErrorAction Stop
-
-    $FinalM365Partner |
-        Format-List *
-}
-catch {
-    Write-Host "Unable to retrieve Microsoft 365 Collaboration configuration." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
-}
-
-# ============================================================
-# M365 Capabilities
-# ============================================================
-
-Write-Host ""
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host " M365 CAPABILITIES" -ForegroundColor Green
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host ""
-
-try {
-    $FinalCapabilities = @(
-        Get-MgPolicyCrossTenantAccessPolicyPartnerM365Capability `
-            -CrossTenantAccessPolicyConfigurationPartnerTenantId $PartnerTenantId `
-            -All `
-            -ErrorAction Stop
+function Get-XtapSummary {
+    param(
+        [Parameter(Mandatory)][object]$Partner,
+        [Parameter(Mandatory)][array]$Capabilities
     )
 
-    if ($FinalCapabilities.Count -eq 0) {
-        Write-Host "No M365 capabilities returned." -ForegroundColor Yellow
+    $M365Inbound = Get-Property -Object $Partner -Name 'm365CollaborationInbound'
+    $M365Outbound = Get-Property -Object $Partner -Name 'm365CollaborationOutbound'
+
+    $InboundStatus = 'Not Configured'
+    $OutboundStatus = 'Not Configured'
+    $Users = 'Not Configured'
+
+    if ($M365Inbound) {
+        $InboundUsers = Get-Property -Object $M365Inbound -Name 'users'
+
+        if ($InboundUsers) {
+            $AccessType = Get-Property -Object $InboundUsers -Name 'accessType'
+
+            if ($AccessType -eq 'allowed') {
+                $InboundStatus = 'Allowed'
+            }
+            elseif ($AccessType) {
+                $InboundStatus = [string]$AccessType
+            }
+
+            $Targets = Get-Property -Object $InboundUsers -Name 'targets'
+
+            if ($Targets) {
+                $TargetNames = @()
+
+                foreach ($Target in @($Targets)) {
+                    $TargetName = Get-Property -Object $Target -Name 'target'
+
+                    if ($TargetName) {
+                        $TargetNames += [string]$TargetName
+                    }
+                }
+
+                if ($TargetNames.Count -gt 0) {
+                    $Users = $TargetNames -join ', '
+                }
+            }
+        }
+    }
+
+    if ($M365Outbound) {
+        $OutboundUsers = Get-Property -Object $M365Outbound -Name 'users'
+
+        if ($OutboundUsers) {
+            $AccessType = Get-Property -Object $OutboundUsers -Name 'accessType'
+
+            if ($AccessType -eq 'allowed') {
+                $OutboundStatus = 'Allowed'
+            }
+            elseif ($AccessType) {
+                $OutboundStatus = [string]$AccessType
+            }
+        }
+    }
+
+    $FreeBusy = 'Not Configured'
+    $MailTips = 'Not Configured'
+    $Calendar = 'Not Configured'
+
+    foreach ($Capability in $Capabilities) {
+        if (-not (Test-CapabilityAllowed -Capability $Capability)) {
+            continue
+        }
+
+        $Name = Get-CapabilityName -Capability $Capability
+
+        switch ($Name) {
+            'crossTenantCalendarAvailabilityBasic' {
+                $FreeBusy = 'Availability Only - Time'
+            }
+
+            'crossTenantCalendarAvailabilityLimitedDetails' {
+                $FreeBusy = 'Limited Details - Time, Subject, Location'
+            }
+
+            'crossTenantMailTipsLimited' {
+                $MailTips = 'Limited'
+            }
+
+            'crossTenantMailTipsAll' {
+                $MailTips = 'All'
+            }
+
+            'crossTenantCalendarSharingFreeBusySimple' {
+                $Calendar = 'Free/Busy Simple - Time'
+            }
+
+            'crossTenantCalendarSharingFreeBusyDetail' {
+                $Calendar = 'Free/Busy Detail - Time, Subject, Location'
+            }
+
+            'crossTenantCalendarSharingFreeBusyReviewer' {
+                $Calendar = 'Reviewer - Full Calendar Details'
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        InboundAccess    = $InboundStatus
+        OutboundAccess   = $OutboundStatus
+        Users            = $Users
+        FreeBusy         = $FreeBusy
+        MailTips         = $MailTips
+        CalendarSharing  = $Calendar
+    }
+}
+
+function Show-XtapConfiguration {
+    param(
+        [Parameter(Mandatory)][string]$PartnerTenantId,
+        [string]$PartnerDisplayName,
+        [string]$PartnerDomain,
+        [string]$ConnectedTenantId
+    )
+
+    $Partner = Get-XtapPartner -PartnerTenantId $PartnerTenantId
+    $Capabilities = @(Get-XtapCapabilities -PartnerTenantId $PartnerTenantId)
+
+    $Summary = Get-XtapSummary -Partner $Partner -Capabilities $Capabilities
+
+    Write-Section 'XTAP CONFIGURATION'
+
+    if ($ConnectedTenantId) {
+        Write-Host "Connected Tenant  : $ConnectedTenantId"
+    }
+
+    if ($PartnerDisplayName) {
+        Write-Host "Partner Name      : $PartnerDisplayName"
+    }
+
+    if ($PartnerDomain) {
+        Write-Host "Partner Domain    : $PartnerDomain"
+    }
+
+    Write-Host "Partner Tenant ID : $PartnerTenantId"
+
+    Write-Section 'MICROSOFT 365 COLLABORATION'
+
+    Write-Host "Inbound Access    : $($Summary.InboundAccess)"
+    Write-Host "Users             : $($Summary.Users)"
+    Write-Host "Outbound Access   : $($Summary.OutboundAccess)"
+
+    Write-Section 'MICROSOFT 365 CAPABILITIES'
+
+    Write-Host "Free/Busy         : $($Summary.FreeBusy)"
+    Write-Host "MailTips          : $($Summary.MailTips)"
+    Write-Host "Calendar Sharing  : $($Summary.CalendarSharing)"
+
+    Write-Section 'XTAP CONFIGURATION SUMMARY'
+
+    Write-Host "Partner Tenant ID : $PartnerTenantId"
+
+    if ($Summary.InboundAccess -eq 'Allowed') {
+        Write-Host 'M365 Collaboration: Enabled' -ForegroundColor Green
     }
     else {
-        $FinalCapabilities |
-            Format-List *
+        Write-Host 'M365 Collaboration: Not Configured' -ForegroundColor Yellow
+    }
+
+    Write-Host "Free/Busy         : $($Summary.FreeBusy)"
+    Write-Host "MailTips          : $($Summary.MailTips)"
+    Write-Host "Calendar Sharing  : $($Summary.CalendarSharing)"
+    Write-Host ''
+}
+
+function Start-ViewWorkflow {
+    param([Parameter(Mandatory)][string]$ConnectedTenantId)
+
+    Write-Section 'VIEW EXISTING XTAP CONFIGURATION'
+
+    Write-Host 'Retrieving existing cross-tenant partner relationships...' -ForegroundColor Yellow
+
+    $Partners = @(Get-XtapPartners)
+
+    if ($Partners.Count -eq 0) {
+        Write-Host 'No partner relationships were returned.' -ForegroundColor Yellow
+        return
+    }
+
+    $Selected = Select-XtapPartner -Partners $Partners
+
+    if ($null -eq $Selected) {
+        return
+    }
+
+    Show-XtapConfiguration `
+        -PartnerTenantId $Selected.TenantId `
+        -PartnerDisplayName $Selected.DisplayName `
+        -ConnectedTenantId $ConnectedTenantId
+
+    Write-Host 'View operation complete. No changes were made.' -ForegroundColor Green
+}
+
+function Read-CapabilitySelections {
+    Write-Section 'FREE/BUSY ACCESS'
+
+    Write-Host '  0. Do not configure Free/Busy'
+    Write-Host '  1. Availability Only - Time'
+    Write-Host '  2. Limited Details - Time, Subject, Location'
+    Write-Host ''
+
+    $FreeBusyChoice = Read-Number -Prompt 'Select Free/Busy capability [0-2]' -Minimum 0 -Maximum 2
+
+    $FreeBusyCapability = $null
+    $FreeBusyDescription = 'Not Configured'
+
+    if ($FreeBusyChoice -eq 1) {
+        $FreeBusyCapability = 'crossTenantCalendarAvailabilityBasic'
+        $FreeBusyDescription = 'Availability Only - Time'
+    }
+
+    if ($FreeBusyChoice -eq 2) {
+        $FreeBusyCapability = 'crossTenantCalendarAvailabilityLimitedDetails'
+        $FreeBusyDescription = 'Limited Details - Time, Subject, Location'
+    }
+
+    Write-Section 'MAILTIPS ACCESS'
+
+    Write-Host '  0. Do not configure MailTips'
+    Write-Host '  1. Limited'
+    Write-Host '  2. All'
+    Write-Host ''
+
+    $MailTipsChoice = Read-Number -Prompt 'Select MailTips capability [0-2]' -Minimum 0 -Maximum 2
+
+    $MailTipsCapability = $null
+    $MailTipsDescription = 'Not Configured'
+
+    if ($MailTipsChoice -eq 1) {
+        $MailTipsCapability = 'crossTenantMailTipsLimited'
+        $MailTipsDescription = 'Limited'
+    }
+
+    if ($MailTipsChoice -eq 2) {
+        $MailTipsCapability = 'crossTenantMailTipsAll'
+        $MailTipsDescription = 'All'
+    }
+
+    Write-Section 'CALENDAR SHARING ACCESS'
+
+    Write-Host '  0. Do not configure Calendar Sharing'
+    Write-Host '  1. Free/Busy Simple - Time'
+    Write-Host '  2. Free/Busy Detail - Time, Subject, Location'
+    Write-Host '  3. Reviewer - Full Calendar Details'
+    Write-Host ''
+
+    $CalendarChoice = Read-Number -Prompt 'Select Calendar Sharing capability [0-3]' -Minimum 0 -Maximum 3
+
+    $CalendarCapability = $null
+    $CalendarDescription = 'Not Configured'
+
+    if ($CalendarChoice -eq 1) {
+        $CalendarCapability = 'crossTenantCalendarSharingFreeBusySimple'
+        $CalendarDescription = 'Free/Busy Simple - Time'
+    }
+
+    if ($CalendarChoice -eq 2) {
+        $CalendarCapability = 'crossTenantCalendarSharingFreeBusyDetail'
+        $CalendarDescription = 'Free/Busy Detail - Time, Subject, Location'
+    }
+
+    if ($CalendarChoice -eq 3) {
+        $CalendarCapability = 'crossTenantCalendarSharingFreeBusyReviewer'
+        $CalendarDescription = 'Reviewer - Full Calendar Details'
+    }
+
+    $Capabilities = @()
+
+    if ($FreeBusyCapability) {
+        $Capabilities += $FreeBusyCapability
+    }
+
+    if ($CalendarCapability) {
+        $Capabilities += $CalendarCapability
+    }
+
+    if ($MailTipsCapability) {
+        $Capabilities += $MailTipsCapability
+    }
+
+    return [PSCustomObject]@{
+        Capabilities        = $Capabilities
+        FreeBusyDescription = $FreeBusyDescription
+        MailTipsDescription = $MailTipsDescription
+        CalendarDescription = $CalendarDescription
     }
 }
-catch {
-    Write-Host "Unable to retrieve M365 capabilities with the v1.0 PowerShell cmdlet." -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Red
+
+function Ensure-Partner {
+    param([Parameter(Mandatory)][string]$PartnerTenantId)
+
+    $PartnersUri = 'https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners'
+    $PartnerUri = "$PartnersUri/$PartnerTenantId"
+
+    Write-Section 'ENTRA CROSS-TENANT PARTNER POLICY'
+
+    $Partner = $null
+
+    try {
+        $Partner = Invoke-XtapGraph -Method GET -Uri $PartnerUri
+    }
+    catch {
+        if (-not (Test-NotFound -ErrorRecord $_)) {
+            throw
+        }
+    }
+
+    if ($null -eq $Partner) {
+        Write-Host 'Creating parent partner policy...' -ForegroundColor Yellow
+
+        $Body = @{
+            tenantId = $PartnerTenantId
+        }
+
+        Invoke-XtapGraph -Method POST -Uri $PartnersUri -Body $Body | Out-Null
+
+        Write-Host 'Parent partner policy created.' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'Parent partner policy already exists.' -ForegroundColor Green
+    }
+
+    $Partner = Invoke-XtapGraph -Method GET -Uri $PartnerUri
+
+    if ($null -eq $Partner) {
+        throw 'Parent partner policy could not be verified.'
+    }
+
+    Write-Host 'Parent partner policy verified.' -ForegroundColor Green
+}
+
+function Set-M365Trust {
+    param([Parameter(Mandatory)][string]$PartnerTenantId)
+
+    Write-Section 'MICROSOFT 365 COLLABORATION TRUST'
+
+    $Uri = "https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners/$PartnerTenantId"
+
+    $Body = @{
+        m365CollaborationInbound = @{
+            users = @{
+                accessType = 'allowed'
+                targets = @(
+                    @{
+                        target     = 'AllUsers'
+                        targetType = 'user'
+                    }
+                )
+            }
+        }
+    }
+
+    Write-Host 'Applying Microsoft 365 Collaboration inbound trust...' -ForegroundColor Yellow
+
+    Invoke-XtapGraph -Method PATCH -Uri $Uri -Body $Body | Out-Null
+
+    Write-Host 'Microsoft 365 Collaboration inbound trust applied.' -ForegroundColor Green
+}
+
+function Set-M365Capabilities {
+    param(
+        [Parameter(Mandatory)][string]$PartnerTenantId,
+        [Parameter(Mandatory)][array]$Capabilities
+    )
+
+    $Uri = "https://graph.microsoft.com/v1.0/policies/crossTenantAccessPolicy/partners/$PartnerTenantId/m365Capabilities"
+
+    $Existing = @(Get-XtapCapabilities -PartnerTenantId $PartnerTenantId)
+
+    Write-Section 'CONFIGURE M365 CAPABILITIES'
+
+    foreach ($CapabilityName in $Capabilities) {
+        $Found = $false
+
+        foreach ($ExistingCapability in $Existing) {
+            if ((Get-CapabilityName -Capability $ExistingCapability) -eq $CapabilityName) {
+                $Found = $true
+                break
+            }
+        }
+
+        $Body = @{
+            '@odata.type' = "#microsoft.graph.$CapabilityName"
+            inboundAccess = @{
+                isAllowed = $true
+                resourceScopes = @{
+                    included = @(
+                        @{
+                            resourceId   = 'All'
+                            resourceType = 'user'
+                        }
+                    )
+                    excluded = @()
+                }
+            }
+        }
+
+        if (-not $Found) {
+            Write-Host "Creating: $CapabilityName" -ForegroundColor Yellow
+
+            Invoke-XtapGraph -Method POST -Uri $Uri -Body $Body | Out-Null
+
+            Write-Host "Created: $CapabilityName" -ForegroundColor Green
+        }
+        else {
+            Write-Host "Already exists: $CapabilityName" -ForegroundColor Green
+        }
+
+        Write-Host "Updating: $CapabilityName" -ForegroundColor Yellow
+
+        $CapabilityUri = "$Uri/$CapabilityName"
+
+        Invoke-XtapGraph -Method PATCH -Uri $CapabilityUri -Body $Body | Out-Null
+
+        Write-Host "Configured: $CapabilityName" -ForegroundColor Green
+        Write-Host ''
+    }
+}
+
+function Start-ConfigureWorkflow {
+    param([Parameter(Mandatory)][string]$ConnectedTenantId)
+
+    Write-Section 'CONFIGURE OR UPDATE PARTNER TENANT'
+
+    $Domain = Read-PartnerDomain
+
+    Write-Host ''
+    Write-Host "Resolving the Microsoft Entra tenant for $Domain..." -ForegroundColor Yellow
+
+    $PartnerTenantId = Resolve-PartnerTenantId -Domain $Domain
+
+    if ($PartnerTenantId -eq $ConnectedTenantId) {
+        throw 'The connected tenant and partner tenant cannot be the same.'
+    }
+
+    Write-Host ''
+    Write-Host "Partner Domain    : $Domain" -ForegroundColor Green
+    Write-Host "Partner Tenant ID : $PartnerTenantId" -ForegroundColor Green
+
+    $Selection = Read-CapabilitySelections
+
+    if ($Selection.Capabilities.Count -eq 0) {
+        Write-Host 'No capabilities were selected. No changes made.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Section 'SELECTED CONFIGURATION'
+
+    Write-Host "Partner Domain    : $Domain"
+    Write-Host "Partner Tenant ID : $PartnerTenantId"
+    Write-Host ''
+    Write-Host "Free/Busy         : $($Selection.FreeBusyDescription)"
+    Write-Host "MailTips          : $($Selection.MailTipsDescription)"
+    Write-Host "Calendar Sharing  : $($Selection.CalendarDescription)"
+    Write-Host ''
+
+    $Continue = Read-YesNo -Prompt 'Continue with this configuration?'
+
+    if (-not $Continue) {
+        Write-Host 'Operation cancelled. No changes made.' -ForegroundColor Yellow
+        return
+    }
+
+    Ensure-Partner -PartnerTenantId $PartnerTenantId
+
+    Set-M365Trust -PartnerTenantId $PartnerTenantId
+
+    Set-M365Capabilities `
+        -PartnerTenantId $PartnerTenantId `
+        -Capabilities $Selection.Capabilities
+
+    Write-Host ''
+    Write-Host 'Retrieving final configuration...' -ForegroundColor Yellow
+
+    Show-XtapConfiguration `
+        -PartnerTenantId $PartnerTenantId `
+        -PartnerDomain $Domain `
+        -ConnectedTenantId $ConnectedTenantId
+
+    Write-Host 'XTAP configuration complete.' -ForegroundColor Green
 }
 
 # ============================================================
-# Human-Readable Summary
+# SCRIPT START
 # ============================================================
 
-Write-Host ""
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host " CONFIGURATION SUMMARY" -ForegroundColor Green
-Write-Host "==================================================" -ForegroundColor Green
-Write-Host ""
+Write-Section 'MICROSOFT 365 XTAP MANAGEMENT'
 
-Write-Host "Connected Tenant  : $ConnectedTenantId"
-Write-Host "Partner Domain    : $PartnerDomain"
-Write-Host "Partner Tenant ID : $PartnerTenantId"
+$InitialChoice = Read-Number `
+    -Prompt '1 = View existing XTAP, 2 = Configure/update XTAP, 3 = Exit' `
+    -Minimum 1 `
+    -Maximum 3
 
-Write-Host ""
-Write-Host "Requested Configuration" -ForegroundColor Cyan
-Write-Host "-----------------------"
-
-Write-Host "Free/Busy         : $FreeBusyDescription"
-Write-Host "MailTips          : $MailTipsDescription"
-Write-Host "Calendar Sharing  : $CalendarDescription"
-
-Write-Host ""
-Write-Host "Selected Graph Capabilities" -ForegroundColor Cyan
-Write-Host "---------------------------"
-
-foreach ($Capability in $Capabilities) {
-    Write-Host "  $Capability"
+if ($InitialChoice -eq 3) {
+    Write-Host 'Exiting. No changes made.'
+    return
 }
 
-Write-Host ""
+Initialize-Graph
 
-# ============================================================
-# Complete
-# ============================================================
+$ConnectedTenantId = Connect-XtapGraph
 
-Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host " XTAP CONFIGURATION COMPLETE" -ForegroundColor Cyan
-Write-Host "==================================================" -ForegroundColor Cyan
-Write-Host ""
+$CurrentChoice = $InitialChoice
+$KeepRunning = $true
 
-Write-Host "The parent Entra policy, Microsoft 365 Collaboration trust," -ForegroundColor Green
-Write-Host "and selected M365 capabilities have been configured." -ForegroundColor Green
-Write-Host ""
+while ($KeepRunning) {
+    try {
+        if ($CurrentChoice -eq 1) {
+            Start-ViewWorkflow -ConnectedTenantId $ConnectedTenantId
+        }
+        elseif ($CurrentChoice -eq 2) {
+            Start-ConfigureWorkflow -ConnectedTenantId $ConnectedTenantId
+        }
+        elseif ($CurrentChoice -eq 3) {
+            $KeepRunning = $false
+        }
+    }
+    catch {
+        Write-Host ''
+        Write-Host 'Operation failed.' -ForegroundColor Red
+        Write-GraphError -ErrorRecord $_
+    }
 
-Write-Host "The configuration displayed above was retrieved using" -ForegroundColor Green
-Write-Host "Microsoft Graph v1.0 PowerShell Get cmdlets." -ForegroundColor Green
-Write-Host ""
+    if (-not $KeepRunning) {
+        break
+    }
+
+    Write-Host ''
+
+    $Return = Read-YesNo -Prompt 'Return to the main menu?'
+
+    if (-not $Return) {
+        break
+    }
+
+    Write-Section 'MICROSOFT 365 CROSS-TENANT ACCESS POLICY'
+
+    Write-Host '  1. View existing XTAP configuration'
+    Write-Host '  2. Configure or update a partner tenant'
+    Write-Host '  3. Exit'
+    Write-Host ''
+
+    $CurrentChoice = Read-Number `
+        -Prompt 'Select an option [1-3]' `
+        -Minimum 1 `
+        -Maximum 3
+
+    if ($CurrentChoice -eq 3) {
+        $KeepRunning = $false
+    }
+}
+
+Write-Host ''
+Write-Host 'XTAP management session complete.' -ForegroundColor Cyan
+Write-Host ''
 
 # Disconnect-MgGraph
